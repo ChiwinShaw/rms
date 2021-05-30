@@ -1,0 +1,149 @@
+import argparse
+import pandas as pd
+import numpy as np
+import datetime
+import time
+import os.path
+from io import StringIO
+import threading
+import os.path
+from queue import Queue
+from time import perf_counter
+import logging
+import scipy
+import scipy.signal
+
+level = logging.INFO
+log_format = "{asctime} {message}"
+
+if not os.path.exists('./Logs'):
+    os.makedirs('./Logs')
+
+
+dt = datetime.datetime.utcnow()
+strDT = dt.strftime("%y%m%d_%H%M%S")
+###
+logFileName = f'./Logs/processed_{strDT}.log'
+
+handlers = [logging.FileHandler(logFileName), logging.StreamHandler()]
+logging.Formatter.converter = time.gmtime
+logging.basicConfig(level=level, format=log_format, style='{', handlers=handlers)
+
+global gblJobcounter
+global gblReportinterval
+global gblNumberOfConcurentThreads
+global gblRootFolder
+
+gblLock = threading.Lock()
+
+global gblOdf
+gblOdf = pd.DataFrame(columns=['ID', 'Loc', 'min', 'max', 'avg'])
+
+
+def process_socket(id, loc_name):
+    global gblJobcounter
+    global gbl_conn
+    global gblRootFolder
+
+    strCsvDirName = os.path.join(gblRootFolder, f'{loc_name}')
+    strCsvFileName = f'{loc_name}_{id}.csv'
+    strCsvName = os.path.join(strCsvDirName, strCsvFileName)
+
+    df_rms = pd.read_csv(strCsvName)
+
+    ##Modification
+    df_rms['RMS_MedianFilter'] = scipy.signal.medfilt(df_rms['RMS'].tolist(), 31)
+    # Identify the extreme value and get the ratio
+    min_rms = df_rms.RMS_MedianFilter.min()
+    max_rms = df_rms.RMS_MedianFilter.max()
+    avg_rms = df_rms.RMS_MedianFilter.mean()
+
+    row_values = [id, loc_name, min_rms, max_rms, avg_rms]
+    gblOdf.loc[gblJobcounter] = row_values
+
+    gblJobcounter = gblJobcounter + 1
+    gblLock.acquire()
+    if gblJobcounter % gblReportinterval == 0:
+        msg = f'Processed {gblJobcounter} sockets ... {id} {loc_name}'
+        logging.info(msg)
+    gblLock.release()
+
+
+def process_sockets_thread(queue):
+    while not queue.empty():
+        row = queue.get()
+        loc = row['Loc']
+        id = row['ID']
+        process_socket(id, loc)
+        queue.task_done()
+
+
+def main(szCsvFileName, startIdx, endIdx):
+    global gblJobcounter
+    global gblReportinterval
+    global gblNumberOfConcurentThreads
+
+    df_all_sockets = pd.read_csv(szCsvFileName)  # read list of all items
+
+    if endIdx == 0:  # determmine which items will be processed in this batch
+        df_all_items = df_all_items[startIdx:-1]
+    else:
+        df_all_items = df_all_items[startIdx:endIdx]
+
+    jobs = Queue()  # load the batch of sockets in a Queue
+
+    for index, row in df_all_items.iterrows():
+        jobs.put(row)
+
+    num_items = jobs.qsize()
+
+    if endIdx == 0:
+        endIdx = num_items
+
+    start_time = perf_counter()
+    gblJobcounter = 0  # record start time
+
+    msg = f'Proccessing {num_sockets} sockets from {startIdx} to {endIdx} using {gblNumberOfConcurentThreads} concurent threads ...'
+    logging.info(msg)
+
+    # create threads to run the task
+    for indexthread in range(gblNumberOfConcurentThreads):  # start multiple concurent threads
+
+        x = threading.Thread(target=process_sockets_thread, args=(jobs,))
+
+        x.start()
+
+    jobs.join()
+
+    gblOdf.to_csv(outputFile)
+
+    end_time = perf_counter()  # record completion time
+    elapsed_time = round(end_time - start_time, 3)  # compute elapsed time
+
+    msg = f"It took {elapsed_time} seconds to process {num_items} items. Num of jobs: {gblJobcounter}"
+    logging.info(msg)
+
+
+def processArgs():
+    try:
+        # Initiate all arguments and their default values:
+        parser = argparse.ArgumentParser(description="Plot RMS Time series")
+        parser.add_argument("-b", "--begin", default=0, help="First Index", type=int)
+        parser.add_argument("-e", "--end", default=0, help="End Index", type=int)
+        parser.add_argument("-df", "--datafile", help="Csv File")
+        parser.add_argument("-t", "--threads", default=1, help="Number of concurrent threads", type=int)
+        parser.add_argument("-i", "--interval", default=100, help="Reporting Interval", type=int)
+        parser.add_argument("-rf", "--rootfolder", default='./RMS', help="Output Folder")
+        parser.add_argument("-o", "--output", default='output.csv', help="Output File")
+        return parser.parse_args()
+    except Exception:
+        logging.critical("[Error] incorrect format", exc_info=True)
+
+
+if __name__ == '__main__':
+    args = processArgs()
+    gblReportinterval = args.interval
+    gblNumberOfConcurentThreads = args.threads
+    gblRootFolder = args.rootfolder
+    outputFile = args.output
+    main(args.datafile, args.begin, args.end)
